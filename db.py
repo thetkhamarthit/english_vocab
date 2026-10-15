@@ -2,12 +2,14 @@
 import json
 import sqlite3
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 
 REQUIRED = ["id", "lesson", "word", "meaning_th", "example_en", "example_th", "target_in_sentence"]
 DEFAULTS = {"new_per_day": 20, "max_reviews": 200, "direction": "EN→TH", "tts_rate": 0.9,
             "practice_srs": True}
+SQLITE_MAGIC = b"SQLite format 3\x00"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS vocab(
@@ -35,6 +37,73 @@ def connect(path):
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
     return con
+
+
+# ---------- backup / restore ----------
+def snapshot_bytes(con, work_dir: Path) -> bytes:
+    """Consistent copy of the live DB (SQLite backup API)."""
+    tmp = Path(work_dir) / ".backup_tmp.db"
+    tmp.unlink(missing_ok=True)
+    dst = sqlite3.connect(str(tmp))
+    try:
+        con.backup(dst)
+    finally:
+        dst.close()
+    data = tmp.read_bytes()
+    tmp.unlink(missing_ok=True)
+    return data
+
+
+def inspect_backup(data: bytes, work_dir: Path):
+    """Validate an uploaded backup. Returns summary dict or raises ValueError."""
+    if not data.startswith(SQLITE_MAGIC):
+        raise ValueError("ไฟล์นี้ไม่ใช่ไฟล์ vocab.db (ไม่ใช่ฐานข้อมูล SQLite)")
+    tmp = Path(work_dir) / ".restore_check.db"
+    tmp.write_bytes(data)
+    try:
+        c = sqlite3.connect(str(tmp))
+        tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not {"vocab", "srs_state", "review_log"} <= tables:
+            raise ValueError("ไฟล์นี้ไม่ใช่ข้อมูลของแอปนี้ (ไม่พบตาราง vocab / srs_state / review_log)")
+        cols = {r[1] for r in c.execute("PRAGMA table_info(srs_state)")}
+        if not {"word_id", "due_date", "interval_days"} <= cols:
+            raise ValueError("ไฟล์นี้ไม่ใช่ข้อมูลของแอปนี้ (โครงสร้างตารางไม่ตรง)")
+        if c.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise ValueError("ไฟล์เสียหาย")
+        info = dict(
+            words=c.execute("SELECT COUNT(*) FROM vocab").fetchone()[0],
+            learned=c.execute("SELECT COUNT(*) FROM srs_state").fetchone()[0],
+            reviews=c.execute("SELECT COUNT(*) FROM review_log").fetchone()[0],
+            last=c.execute("SELECT MAX(ts) FROM review_log").fetchone()[0],
+        )
+        c.close()
+        return info
+    except sqlite3.DatabaseError as e:
+        raise ValueError(f"เปิดไฟล์ไม่ได้: {e}") from e
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def restore_bytes(con, data: bytes, work_dir: Path):
+    """Replace the live DB contents with an uploaded backup (same connection stays valid)."""
+    inspect_backup(data, work_dir)
+    tmp = Path(work_dir) / ".restore_src.db"
+    tmp.write_bytes(data)
+    try:
+        src = sqlite3.connect(str(tmp))
+        src.backup(con)
+        src.close()
+    finally:
+        tmp.unlink(missing_ok=True)
+    con.executescript(SCHEMA)          # older backups: add tables that are new in this version
+
+
+def summary(con):
+    return dict(
+        learned=con.execute("SELECT COUNT(*) FROM srs_state").fetchone()[0],
+        reviews=con.execute("SELECT COUNT(*) FROM review_log").fetchone()[0],
+        last=con.execute("SELECT MAX(ts) FROM review_log").fetchone()[0],
+    )
 
 
 # ---------- vocab ----------
