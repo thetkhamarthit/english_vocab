@@ -1,19 +1,26 @@
 """1000 Vocab review app: Today (SRS flashcards) + Practice modes + Word List + Settings."""
 import html
+import os
 import random
 import time
 from datetime import date
 from pathlib import Path
 
+# Thai time for "today", streaks and logs (Streamlit Cloud servers run on UTC)
+os.environ["TZ"] = "Asia/Bangkok"
+if hasattr(time, "tzset"):
+    time.tzset()
+
 import streamlit as st
 
+import cloud_sync as cs
 import db
 import practice
 import srs
 from ui import WIDE, card_back_html, inject_css, speak_buttons
 
 BASE = Path(__file__).parent
-DB_PATH = BASE / "vocab.db"
+DB_PATH = cs.db_path(BASE)
 XLSX_PATH = BASE / "vocab_1000.xlsx"
 
 st.set_page_config(page_title="1000 Vocab", page_icon="📚", layout="centered")
@@ -22,10 +29,20 @@ inject_css()
 
 @st.cache_resource
 def get_con():
-    return db.connect(str(DB_PATH))
+    cs.restore(DB_PATH)                  # cloud: download vocab.db from GitHub first
+    con = db.connect(str(DB_PATH))
+    cs.start(con, DB_PATH)               # cloud: background auto-upload
+    return con
 
 
-con = get_con()
+try:
+    con = get_con()
+except cs.SyncError as e:
+    st.error(f"☁️ โหลดข้อมูลจาก GitHub ไม่สำเร็จ: {e}")
+    st.caption("แอปหยุดไว้ก่อนเพื่อไม่ให้ข้อมูลเดิมถูกเขียนทับ · ตรวจ Secrets ใน Streamlit Cloud แล้วกดลองใหม่")
+    st.button("🔄 ลองใหม่")
+    st.stop()
+
 today_d = date.today()
 TODAY = today_d.isoformat()
 S = db.get_settings(con)
@@ -37,12 +54,14 @@ if db.vocab_count(con) == 0:
     st.title("📚 1000 Vocab")
     if XLSX_PATH.exists():
         n = db.import_excel(con, XLSX_PATH)
+        cs.force_sync()
         st.success(f"นำเข้าคำศัพท์ {n} คำ จาก {XLSX_PATH.name}")
         st.rerun()
     up = st.file_uploader("อัปโหลด vocab_1000.xlsx", type="xlsx")
     if up:
         try:
             st.success(f"นำเข้าคำศัพท์ {db.import_excel(con, up)} คำ")
+            cs.force_sync()
             st.rerun()
         except ValueError as e:
             st.error(str(e))
@@ -82,10 +101,13 @@ def rate(wid, rating, direction):
         st.session_state.done += 1
     st.session_state.revealed = False
     st.session_state.t0 = time.time()
+    if not q:
+        cs.force_sync()
 
 
 def end_session():
     st.session_state.pop("queue", None)
+    cs.force_sync()
 
 
 def review_view():
@@ -136,6 +158,17 @@ def review_view():
     st.button("⏹ จบการทวน", on_click=end_session, **WIDE)
 
 
+# ---------- cloud status ----------
+def sync_caption():
+    s = cs.status(con)
+    if not s["enabled"]:
+        return ""
+    if s["error"]:
+        return f"☁️ ⚠️ ซิงก์ไม่สำเร็จ: {s['error']}"
+    last = f"{s['last_ok']:%H:%M}" if s["last_ok"] else "—"
+    return f"☁️ ซิงก์ล่าสุด {last}" + (" · มีข้อมูลรอซิงก์" if s["pending"] else " · ✓ ล่าสุดแล้ว")
+
+
 # ---------- pages ----------
 def page_today():
     if "queue" in st.session_state:
@@ -165,6 +198,9 @@ def page_today():
     c.metric(STATUS_TH["mastered"], cnt["mastered"])
     st.caption(f"ตอบไปแล้ววันนี้ {db.reviewed_today(con, TODAY)} ครั้ง (รวมโหมดฝึก) · "
                f"'จำได้แล้ว' = ช่วงทวนถัดไป ≥ {srs.MASTERED_DAYS} วัน")
+    cap = sync_caption()
+    if cap:
+        st.caption(cap)
 
 
 def page_words():
@@ -226,14 +262,26 @@ def page_settings():
             for k, v in dict(new_per_day=n, max_reviews=m, direction=d, tts_rate=r,
                              practice_srs=ps).items():
                 db.set_setting(con, k, v)
+            cs.force_sync()
             st.success("บันทึกแล้ว")
             st.rerun()
+
+    st.markdown("#### ☁️ ซิงก์ข้อมูล")
+    s = cs.status(con)
+    if s["enabled"]:
+        st.caption(f"repo: {s['repo']} · {sync_caption()}")
+        if st.button("☁️ ซิงก์เดี๋ยวนี้", **WIDE):
+            err = cs.sync_now(con, DB_PATH)
+            st.error(f"ซิงก์ไม่สำเร็จ: {err}") if err else st.success("ซิงก์เรียบร้อย")
+    else:
+        st.caption("โหมด local · ข้อมูลเก็บในไฟล์ vocab.db บนเครื่องนี้")
 
     st.markdown("#### ข้อมูล")
     up = st.file_uploader("นำเข้า Excel ที่แก้ไขแล้ว (ความคืบหน้าเดิมยังอยู่)", type="xlsx")
     if up and st.button("📥 นำเข้า", **WIDE):
         try:
             st.success(f"อัปเดตคำศัพท์ {db.import_excel(con, up)} คำ")
+            cs.force_sync()
         except ValueError as e:
             st.error(str(e))
     if DB_PATH.exists():

@@ -1,0 +1,6 @@
+vocab.db
+.vocab_cloud.db
+*.db
+__pycache__/
+.streamlit/secrets.toml
+1000_Vocab.pdf
